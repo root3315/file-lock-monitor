@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -10,12 +11,14 @@ from unittest.mock import mock_open, patch
 
 from file_lock_monitor import (
     LockInfo,
+    TimeoutError,
     find_locks_for_path,
     format_json,
     format_table,
     get_process_name,
     get_process_user,
     parse_lsof_output,
+    read_file_with_timeout,
     run_command,
     scan_proc_locks,
     uid_to_username,
@@ -58,37 +61,60 @@ class TestRunCommand(unittest.TestCase):
         self.assertIn("timed out", stderr)
 
 
+class TestReadFileWithTimeout(unittest.TestCase):
+    """Tests for read_file_with_timeout function."""
+
+    def test_read_existing_file(self):
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+            f.write("test content")
+            temp_path = f.name
+        try:
+            content = read_file_with_timeout(temp_path)
+            self.assertEqual(content, "test content")
+        finally:
+            os.unlink(temp_path)
+
+    def test_read_nonexistent_file(self):
+        content = read_file_with_timeout("/nonexistent/file/path")
+        self.assertIsNone(content)
+
+    def test_read_with_short_timeout(self):
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+            f.write("quick read")
+            temp_path = f.name
+        try:
+            content = read_file_with_timeout(temp_path, timeout=1)
+            self.assertEqual(content, "quick read")
+        finally:
+            os.unlink(temp_path)
+
+
 class TestGetProcessName(unittest.TestCase):
     """Tests for get_process_name function."""
 
-    @patch("builtins.open", new_callable=mock_open, read_data="test_process\n")
-    def test_get_process_name_success(self, mock_file):
+    @patch("file_lock_monitor.read_file_with_timeout", return_value="test_process\n")
+    def test_get_process_name_success(self, mock_read):
         name = get_process_name(1234)
         self.assertEqual(name, "test_process")
-        mock_file.assert_called_once_with("/proc/1234/comm", "r")
+        mock_read.assert_called_once_with("/proc/1234/comm")
 
-    @patch("builtins.open", side_effect=FileNotFoundError)
-    def test_get_process_name_not_found(self, mock_file):
+    @patch("file_lock_monitor.read_file_with_timeout", return_value=None)
+    def test_get_process_name_not_found(self, mock_read):
         name = get_process_name(99999)
-        self.assertEqual(name, "unknown")
-
-    @patch("builtins.open", side_effect=PermissionError)
-    def test_get_process_name_permission_denied(self, mock_file):
-        name = get_process_name(1234)
         self.assertEqual(name, "unknown")
 
 
 class TestGetProcessUser(unittest.TestCase):
     """Tests for get_process_user function."""
 
-    @patch("builtins.open", new_callable=mock_open, read_data="Name:   test\nUid:    1000    1000    1000    1000\n")
-    def test_get_process_user_success(self, mock_file):
+    @patch("file_lock_monitor.read_file_with_timeout", return_value="Name:   test\nUid:    1000    1000    1000    1000\n")
+    def test_get_process_user_success(self, mock_read):
         uid = get_process_user(1234)
         self.assertEqual(uid, "1000")
-        mock_file.assert_called_with("/proc/1234/status", "r")
+        mock_read.assert_called_with("/proc/1234/status")
 
-    @patch("builtins.open", side_effect=FileNotFoundError)
-    def test_get_process_user_not_found(self, mock_file):
+    @patch("file_lock_monitor.read_file_with_timeout", return_value=None)
+    def test_get_process_user_not_found(self, mock_read):
         uid = get_process_user(99999)
         self.assertEqual(uid, "unknown")
 
@@ -174,10 +200,10 @@ class TestScanProcLocks(unittest.TestCase):
 
     @patch("file_lock_monitor.os.listdir", return_value=["1234", "5678"])
     @patch("file_lock_monitor.os.path.exists", return_value=True)
-    @patch("builtins.open", new_callable=mock_open, read_data="0: POSIX  ADVISORY  WRITE 0000000000000000 00:0f:12345 0 0\n")
+    @patch("file_lock_monitor.read_file_with_timeout", return_value="0: POSIX  ADVISORY  WRITE 0000000000000000 00:0f:12345 0 0\n")
     @patch("file_lock_monitor.get_process_name", return_value="test_proc")
     @patch("file_lock_monitor.uid_to_username", return_value="testuser")
-    def test_scan_proc_locks_success(self, mock_uid, mock_name, mock_file, mock_exists, mock_listdir):
+    def test_scan_proc_locks_success(self, mock_uid, mock_name, mock_read, mock_exists, mock_listdir):
         locks = scan_proc_locks()
         self.assertEqual(len(locks), 2)
         self.assertEqual(locks[0].pid, 1234)
@@ -191,8 +217,13 @@ class TestScanProcLocks(unittest.TestCase):
 
     @patch("file_lock_monitor.os.listdir", return_value=["1234"])
     @patch("file_lock_monitor.os.path.exists", return_value=True)
-    @patch("builtins.open", side_effect=PermissionError)
-    def test_scan_proc_locks_permission_denied(self, mock_file, mock_exists, mock_listdir):
+    @patch("file_lock_monitor.read_file_with_timeout", return_value=None)
+    def test_scan_proc_locks_timeout(self, mock_read, mock_exists, mock_listdir):
+        locks = scan_proc_locks()
+        self.assertEqual(len(locks), 0)
+
+    @patch("file_lock_monitor.os.listdir", side_effect=PermissionError)
+    def test_scan_proc_locks_permission_denied(self, mock_listdir):
         locks = scan_proc_locks()
         self.assertEqual(len(locks), 0)
 
